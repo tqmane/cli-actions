@@ -1,0 +1,84 @@
+name: ChatGPT Devbox - Ubuntu
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch/tag/SHA to check out (blank = current/default ref)
+        required: false
+        type: string
+
+concurrency:
+  group: chatgpt-devbox-ubuntu
+  cancel-in-progress: true
+
+jobs:
+  devbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Validate required secrets
+        env:
+          DEVBOX_GIT_PAT: ${{ secrets.DEVBOX_GIT_PAT }}
+          OPENAI_TUNNEL_ID: ${{ secrets.OPENAI_TUNNEL_ID_UBUNTU }}
+          OPENAI_TUNNEL_API_KEY: ${{ secrets.OPENAI_TUNNEL_API_KEY_UBUNTU }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$DEVBOX_GIT_PAT" ]] || { echo "Missing DEVBOX_GIT_PAT"; exit 1; }
+          [[ -n "$OPENAI_TUNNEL_ID" ]] || { echo "Missing OPENAI_TUNNEL_ID_UBUNTU"; exit 1; }
+          [[ -n "$OPENAI_TUNNEL_API_KEY" ]] || { echo "Missing OPENAI_TUNNEL_API_KEY_UBUNTU"; exit 1; }
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.DEVBOX_GIT_PAT }}
+          ref: ${{ inputs.ref || github.ref_name }}
+          persist-credentials: true
+
+      - name: Configure Git identity and GitHub CLI
+        env:
+          GH_TOKEN: ${{ secrets.DEVBOX_GIT_PAT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global user.name "ChatGPT Devbox"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          gh auth setup-git
+
+      - name: Prepare MCP environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv .devbox/venv
+          .devbox/venv/bin/python -m pip install --upgrade pip
+          .devbox/venv/bin/python -m pip install 'mcp>=2,<3'
+
+      - name: Install latest OpenAI tunnel-client
+        shell: bash
+        run: ./scripts/install_tunnel_client.sh
+
+      - name: Start OpenAI Secure MCP Tunnel
+        env:
+          CONTROL_PLANE_API_KEY: ${{ secrets.OPENAI_TUNNEL_API_KEY_UBUNTU }}
+          OPENAI_TUNNEL_ID: ${{ secrets.OPENAI_TUNNEL_ID_UBUNTU }}
+          DEVBOX_ROOT: ${{ github.workspace }}
+          DEVBOX_PLATFORM: ubuntu
+          DEVBOX_DISPLAY_NAME: GitHub Actions Devbox - Ubuntu
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROFILE="github-actions-ubuntu"
+          MCP_COMMAND="env -u CONTROL_PLANE_API_KEY -u OPENAI_TUNNEL_ID '$GITHUB_WORKSPACE/.devbox/venv/bin/python' '$GITHUB_WORKSPACE/tools/devbox_mcp.py'"
+
+          tunnel-client init \
+            --sample sample_mcp_stdio_local \
+            --profile "$PROFILE" \
+            --tunnel-id "$OPENAI_TUNNEL_ID" \
+            --mcp-command "$MCP_COMMAND"
+
+          tunnel-client doctor --profile "$PROFILE" --explain
+          echo "Ubuntu devbox is connected. This step stays in the foreground until the job is cancelled or reaches 6 hours."
+          exec tunnel-client run --profile "$PROFILE"
