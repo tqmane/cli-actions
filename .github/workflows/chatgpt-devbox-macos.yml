@@ -104,15 +104,16 @@ jobs:
 
           READY=0
           HEALTH_BASE=""
-          for _ in $(seq 1 60); do
+          for ((ATTEMPT=1; ATTEMPT<=60; ATTEMPT++)); do
             if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
               set +e
               wait "$TUNNEL_PID"
               STATUS=$?
               set -e
+              [[ "$STATUS" -ne 0 ]] || STATUS=1
               echo "::error::tunnel-client exited before becoming ready (exit $STATUS)."
               tail -n 200 "$TUNNEL_LOG" || true
-              exit "${STATUS:-1}"
+              exit "$STATUS"
             fi
 
             if [[ -s "$HEALTH_URL_FILE" ]]; then
