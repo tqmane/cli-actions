@@ -57,6 +57,8 @@ jobs:
           .devbox/venv/bin/python -m pip install 'mcp>=2,<3'
 
       - name: Install latest OpenAI tunnel-client
+        env:
+          GH_TOKEN: ${{ secrets.DEVBOX_GIT_PAT }}
         shell: bash
         run: ./scripts/install_tunnel_client.sh
 
