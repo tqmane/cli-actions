@@ -75,9 +75,11 @@ jobs:
           PROFILE="github-actions-macos"
           MCP_COMMAND="env -u CONTROL_PLANE_API_KEY -u OPENAI_TUNNEL_ID '$GITHUB_WORKSPACE/.devbox/venv/bin/python' '$GITHUB_WORKSPACE/tools/devbox_mcp.py'"
           HEALTH_URL_FILE="$RUNNER_TEMP/openai-tunnel-macos-health.url"
+          HEALTH_REPORT="$RUNNER_TEMP/openai-tunnel-macos-health.json"
           TUNNEL_LOG="$RUNNER_TEMP/openai-tunnel-macos.log"
+          MCP_WATCH_PID=""
 
-          rm -f "$HEALTH_URL_FILE" "$TUNNEL_LOG"
+          rm -f "$HEALTH_URL_FILE" "$HEALTH_REPORT" "$TUNNEL_LOG"
 
           tunnel-client init \
             --sample sample_mcp_stdio_local \
@@ -89,12 +91,18 @@ jobs:
 
           tunnel-client run \
             --profile "$PROFILE" \
+            --mcp.stdio-send-initialized-notification \
+            --log.level debug \
             --health.listen-addr 127.0.0.1:0 \
             --health.url-file "$HEALTH_URL_FILE" \
             >"$TUNNEL_LOG" 2>&1 &
           TUNNEL_PID=$!
 
           cleanup() {
+            if [[ -n "${MCP_WATCH_PID:-}" ]] && kill -0 "$MCP_WATCH_PID" 2>/dev/null; then
+              kill "$MCP_WATCH_PID" 2>/dev/null || true
+              wait "$MCP_WATCH_PID" 2>/dev/null || true
+            fi
             if kill -0 "$TUNNEL_PID" 2>/dev/null; then
               kill "$TUNNEL_PID" 2>/dev/null || true
               wait "$TUNNEL_PID" 2>/dev/null || true
@@ -113,14 +121,18 @@ jobs:
               STATUS=$?
               set -e
               [[ "$STATUS" -ne 0 ]] || STATUS=1
-              echo "::error::tunnel-client exited before becoming ready (exit $STATUS)."
+              echo "::error::tunnel-client exited before becoming fully ready (exit $STATUS)."
               tail -n 200 "$TUNNEL_LOG" || true
               exit "$STATUS"
             fi
 
             if [[ -s "$HEALTH_URL_FILE" ]]; then
               HEALTH_BASE="$(cat "$HEALTH_URL_FILE" 2>/dev/null || true)"
-              if [[ -n "$HEALTH_BASE" ]] && curl -fsS --max-time 5 "${HEALTH_BASE%/}/readyz" >/dev/null; then
+              if tunnel-client health \
+                --url-file "$HEALTH_URL_FILE" \
+                --pid "$TUNNEL_PID" \
+                --require-control-plane-poll \
+                --json >"$HEALTH_REPORT" 2>&1; then
                 READY=1
                 break
               fi
@@ -129,10 +141,18 @@ jobs:
           done
 
           if [[ "$READY" -ne 1 ]]; then
-            echo "::error::OpenAI Tunnel did not become ready within 120 seconds."
+            echo "::error::OpenAI Tunnel did not become fully ready within 120 seconds (health/readiness/control-plane poll)."
+            if [[ -s "$HEALTH_REPORT" ]]; then
+              echo "--- tunnel health command ---"
+              cat "$HEALTH_REPORT" || true
+              echo
+            fi
             if [[ -n "$HEALTH_BASE" ]]; then
               echo "--- tunnel health details ---"
               curl -sS --max-time 5 "${HEALTH_BASE%/}/health?details=true" || true
+              echo
+              echo "--- MCP discovery health ---"
+              curl -sS --max-time 5 "${HEALTH_BASE%/}/health/mcp" || true
               echo
             fi
             echo "--- tunnel-client log ---"
@@ -140,18 +160,42 @@ jobs:
             exit 1
           fi
 
-          echo "::notice title=OpenAI Tunnel Ready::macOS devbox is ready for ChatGPT connector discovery."
+          echo "::notice title=OpenAI Tunnel Fully Ready::macOS devbox is ready and at least one control-plane poll has succeeded."
           {
             echo "### OpenAI Tunnel - macOS"
             echo "- Status: ready"
+            echo "- Control-plane poll: confirmed"
+            echo "- MCP initialized-notification shim: enabled"
             echo "- MCP identity: GitHub Actions Devbox - macOS"
             echo "- Runner: $RUNNER_OS / $RUNNER_ARCH"
           } >> "$GITHUB_STEP_SUMMARY"
 
+          echo "--- tunnel health command ---"
+          cat "$HEALTH_REPORT" || true
+          echo
           echo "--- tunnel health details ---"
           curl -fsS --max-time 5 "${HEALTH_BASE%/}/health?details=true" || true
           echo
-          echo "macOS devbox is ready. Keeping the tunnel alive until cancellation or the 6-hour job limit."
+          echo "--- initial MCP discovery health ---"
+          curl -sS --max-time 5 "${HEALTH_BASE%/}/health/mcp" || true
+          echo
+
+          (
+            LAST_MCP_HEALTH=""
+            while kill -0 "$TUNNEL_PID" 2>/dev/null; do
+              CURRENT_MCP_HEALTH="$(curl -sS --max-time 5 "${HEALTH_BASE%/}/health/mcp" 2>/dev/null || true)"
+              if [[ -n "$CURRENT_MCP_HEALTH" && "$CURRENT_MCP_HEALTH" != "$LAST_MCP_HEALTH" ]]; then
+                echo "--- MCP discovery health changed at $(date -u +'%Y-%m-%dT%H:%M:%SZ') ---"
+                echo "$CURRENT_MCP_HEALTH"
+                LAST_MCP_HEALTH="$CURRENT_MCP_HEALTH"
+              fi
+              sleep 10
+            done
+          ) &
+          MCP_WATCH_PID=$!
+
+          echo "macOS devbox is ready. Try creating the ChatGPT connector now; MCP discovery changes will be printed above."
+          echo "Keeping the tunnel alive until cancellation or the 6-hour job limit."
 
           set +e
           wait "$TUNNEL_PID"
