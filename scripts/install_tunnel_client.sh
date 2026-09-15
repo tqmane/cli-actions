@@ -18,10 +18,18 @@ case "$(uname -m)" in
   *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
+command -v gh >/dev/null 2>&1 || { echo "GitHub CLI (gh) is required" >&2; exit 1; }
+[[ -n "${GH_TOKEN:-}" ]] || { echo "GH_TOKEN is required to download tunnel-client without hitting unauthenticated GitHub API limits" >&2; exit 1; }
+
 release_json="$TMP/release.json"
-curl -fsSL --retry 4 --retry-delay 2 \
-  https://api.github.com/repos/openai/tunnel-client/releases/latest \
-  -o "$release_json"
+rm -f "$release_json" "$TMP"/*.zip "$TMP/SHA256SUMS.txt"
+
+echo "Resolving latest openai/tunnel-client release via authenticated GitHub API..."
+gh api \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  repos/openai/tunnel-client/releases/latest \
+  > "$release_json"
 
 readarray_compat() {
   python3 - "$release_json" "$os" "$arch" <<'PY'
@@ -30,26 +38,28 @@ p, os_name, arch = sys.argv[1:]
 data = json.load(open(p, encoding="utf-8"))
 tag = data["tag_name"]
 asset_name = f"tunnel-client-{tag}-{os_name}-{arch}.zip"
-assets = {a["name"]: a["browser_download_url"] for a in data.get("assets", [])}
+assets = {a["name"] for a in data.get("assets", [])}
 if asset_name not in assets:
     raise SystemExit(f"release asset not found: {asset_name}")
 if "SHA256SUMS.txt" not in assets:
     raise SystemExit("SHA256SUMS.txt not found in latest release")
 print(tag)
 print(asset_name)
-print(assets[asset_name])
-print(assets["SHA256SUMS.txt"])
 PY
 }
 
 meta="$(readarray_compat)"
 tag="$(printf '%s\n' "$meta" | sed -n '1p')"
 asset="$(printf '%s\n' "$meta" | sed -n '2p')"
-asset_url="$(printf '%s\n' "$meta" | sed -n '3p')"
-sums_url="$(printf '%s\n' "$meta" | sed -n '4p')"
 
-curl -fsSL --retry 4 --retry-delay 2 "$asset_url" -o "$TMP/$asset"
-curl -fsSL --retry 4 --retry-delay 2 "$sums_url" -o "$TMP/SHA256SUMS.txt"
+echo "Downloading $asset and SHA256SUMS.txt from openai/tunnel-client $tag..."
+gh release download "$tag" \
+  --repo openai/tunnel-client \
+  --pattern "$asset" \
+  --pattern "SHA256SUMS.txt" \
+  --dir "$TMP" \
+  --clobber
+
 expected="$(awk -v f="$asset" '$2 == f || $2 == "*" f {print $1; exit}' "$TMP/SHA256SUMS.txt")"
 if [[ -z "$expected" ]]; then
   echo "No checksum found for $asset" >&2
